@@ -242,40 +242,43 @@ static inline BOOL call_dll_entry_point( DLLENTRYPROC proc, void *module,
     struct DllMain_call_data *call2 = &call;
     BOOL ret;
 
-    if (is_32_bit && !i386_wrapper)
-    {
-        static const char template[] =
-        {
-            0x83, 0xec, 0x1c,           /* sub    $0x1c,%esp        */
-            0x8b, 0x41, 0x18,           /* mov    0x18(%ecx),%eax   */
-            0x89, 0x44, 0x24, 0x08,     /* mov    %eax,0x8(%esp)    */
-            0x8b, 0x41, 0x10,           /* mov    0x10(%ecx),%eax   */
-            0x89, 0x44, 0x24, 0x04,     /* mov    %eax,0x4(%esp)    */
-            0x8b, 0x41, 0x08,           /* mov    0x8(%ecx),%eax    */
-            0x89, 0x04, 0x24,           /* mov    %eax,(%esp)       */
-            0xff, 0x11,                 /* call   *(%ecx)           */
-            0x83, 0xec, 0x0c,           /* sub    $0xc,%esp         */
-            0x31, 0xd2,                 /* xor    %edx,%edx         */
-            0x83, 0xc4, 0x1c,           /* add    $0x1c,%esp        */
-            0xc3,                       /* ret                      */
-        };
-        /* Alloc it on the heap, qemu's static data is loaded > 4GB. */
-        i386_wrapper = my_alloc(sizeof(template));
-        memcpy(i386_wrapper, template, sizeof(template));
+    if (!is_32_bit) {
+      static const char x86_64_wrapper[] =
+      {
+          0x48, 0x83, 0xec, 0x28,     /* sub    $0x28,%rsp        */
+          0x48, 0x89, 0xc8,           /* mov    %rcx,%rax         */
+          0x48, 0x8b, 0x49, 0x08,     /* mov    0x8(%rcx),%rcx    */
+          0x4c, 0x8b, 0x40, 0x18,     /* mov    0x18(%rax),%r8    */
+          0x8b, 0x50, 0x10,           /* mov    0x10(%rax),%edx   */
+          0xff, 0x10,                 /* callq  *(%rax)           */
+          0x89, 0xc0,                 /* mov    %eax,%eax ???     */
+          0x48, 0x83, 0xc4, 0x28,     /* add    $0x28,%rsp        */
+          0xc3,                       /* retq                     */
+      };
+      /* Alloc it on the heap, qemu's static data is loaded > 4GB. */
+      wrapper = my_alloc(sizeof(x86_64_wrapper));
+      memcpy(wrapper, x86_64_wrapper, sizeof(x86_64_wrapper));
+    } else {
+      static const char i386_wrapper[] =
+      {
+          0xff, 0x71, 0x18,           /* push DWORD PTR [ecx+24] */
+          0xff, 0x71, 0x10,           /* push DWORD PTR [ecx+16] */
+          0xff ,0x71, 0x08,           /* push DWORD PTR [ecx+8]  */
+          0xff, 0x11,                 /* call DWORD PTR [ecx]    */
+          0x31, 0xd2,                 /* xor  edx, edx           */
+          0xc3,                       /* ret */
+      };
+      /* Alloc it on the heap, qemu's static data is loaded > 4GB. */
+      wrapper = my_alloc(sizeof(i386_wrapper));
+      memcpy(wrapper, i386_wrapper, sizeof(i386_wrapper));
     }
 
-    if (is_32_bit)
-        call2 = my_alloc(sizeof(*call2));
+    call.func = QEMU_H2G(proc);
+    call.module = (uint64_t)module;
+    call.reason = reason;
+    call.reserved = (uint64_t)reserved;
 
-    call2->func = QEMU_H2G(proc);
-    call2->module = (uint64_t)module;
-    call2->reason = reason;
-    call2->reserved = (uint64_t)reserved;
-
-    ret = qemu_execute(is_32_bit ? i386_wrapper : x86_64_wrapper, QEMU_H2G(call2));
-    if (call2 != &call)
-        my_free(call2);
-    return ret;
+    return qemu_execute(wrapper, QEMU_H2G(&call));
 }
 
 /*************************************************************************
@@ -476,7 +479,7 @@ static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
     proc = get_rva( module, functions[ordinal] );
 
     /* if the address falls into the export dir, it's a forward */
-    if (((const char *)proc >= (const char *)exports) && 
+    if (((const char *)proc >= (const char *)exports) &&
         ((const char *)proc < (const char *)exports + exp_size))
         return find_forwarded_export( module, (const char *)proc, load_path, fwd_name );
 
@@ -782,8 +785,12 @@ static BOOL is_dll_native_subsystem( HMODULE module, const IMAGE_NT_HEADERS *nt,
  */
 static SHORT alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
 {
+#ifdef __arm__
+    const IMAGE_TLS_DIRECTORY32 *dir;
+#else
     IMAGE_TLS_DIRECTORY64 dir_copy = {0};
     const IMAGE_TLS_DIRECTORY64 *dir;
+#endif
     const IMAGE_TLS_DIRECTORY32 *dir32;
     ULONG i, size;
     void *new_ptr;
@@ -793,6 +800,7 @@ static SHORT alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
     {
         if (!(dir32 = RtlImageDirectoryEntryToData( mod->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &size )))
             return -1;
+#ifndef __arm__
         dir_copy.StartAddressOfRawData = dir32->StartAddressOfRawData;
         dir_copy.EndAddressOfRawData = dir32->EndAddressOfRawData;
         dir_copy.AddressOfIndex = dir32->AddressOfIndex;
@@ -800,6 +808,9 @@ static SHORT alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
         dir_copy.SizeOfZeroFill = dir32->SizeOfZeroFill;
         dir_copy.Characteristics = dir32->Characteristics;
         dir = &dir_copy;
+#else
+        dir = dir32;
+#endif
     }
     else
     {
@@ -957,12 +968,14 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     status = STATUS_SUCCESS;
     for (i = 0; i < nb_imports; i++)
     {
+        printf("Importing DLL number %i of %i.\n", i, nb_imports);
         if (!import_dll( wm->ldr.DllBase, &imports[i], load_path, &imp ))
         {
             imp = NULL;
             status = STATUS_DLL_NOT_FOUND;
         }
         wm->deps[i] = imp;
+        printf("DLL number %i of %i imported successfully\n", i, nb_imports);
     }
     current_modref = prev;
     if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
@@ -1171,6 +1184,9 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     WINE_TRACE("(%p %s,%s,%p) - CALL\n", module, wine_dbgstr_w(wm->ldr.BaseDllName.Buffer),
             reason_names[reason], lpReserved );
 
+    printf("(%p %s,%s,%p) - CALL\n", module, wine_dbgstr_w(wm->ldr.BaseDllName.Buffer),
+            reason_names[reason], lpReserved );
+
     /* FIXME: Exception handling removed. */
     retv = call_dll_entry_point( entry, module, reason, lpReserved );
     if (!retv)
@@ -1180,6 +1196,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
        to the dll. We cannot assume that this module has not been
        deleted.  */
     WINE_TRACE("(%p,%s,%p) - RETURN %d\n", module, reason_names[reason], lpReserved, retv );
+    printf("(%p,%s,%p) - RETURN %d\n", module, reason_names[reason], lpReserved, retv );
 
     return status;
 }
@@ -1230,6 +1247,7 @@ static NTSTATUS process_attach( WINE_MODREF *wm, LPVOID lpReserved )
         return status;
 
     WINE_TRACE("(%s,%p) - START\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer), lpReserved );
+    printf("(%s,%p) - START\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer), lpReserved );
 
     /* Tag current MODREF to prevent recursive loop */
     wm->ldr.Flags |= LDR_LOAD_IN_PROGRESS;
@@ -1261,6 +1279,7 @@ static NTSTATUS process_attach( WINE_MODREF *wm, LPVOID lpReserved )
             /* point to the name so LdrInitializeThunk can print it */
             last_failed_modref = wm;
             WINE_WARN("Initialization of %s failed\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer));
+            printf("Initialization of %s failed\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer));
         }
         current_modref = prev;
     }
@@ -1270,6 +1289,7 @@ static NTSTATUS process_attach( WINE_MODREF *wm, LPVOID lpReserved )
     wm->ldr.Flags &= ~LDR_LOAD_IN_PROGRESS;
 
     WINE_TRACE("(%s,%p) - END\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer), lpReserved );
+    printf("(%s,%p) - END\n", wine_dbgstr_w(wm->ldr.BaseDllName.Buffer), lpReserved );
     return status;
 }
 
@@ -1318,7 +1338,7 @@ static void process_detach(void)
     {
         for (entry = mark->Blink; entry != mark; entry = entry->Blink)
         {
-            mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, 
+            mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
                                     InInitializationOrderLinks);
             /* Check whether to detach this DLL */
             if ( !(mod->Flags & LDR_PROCESS_ATTACHED) )
@@ -1328,7 +1348,7 @@ static void process_detach(void)
 
             /* Call detach notification */
             mod->Flags &= ~LDR_PROCESS_ATTACHED;
-            MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr), 
+            MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr),
                             DLL_PROCESS_DETACH, ULongToPtr(process_detaching) );
 
             /* Restart at head of WINE_MODREF list, as entries might have
@@ -1363,7 +1383,7 @@ NTSTATUS MODULE_DllThreadAttach( LPVOID lpReserved )
     mark = &qemu_getTEB()->Peb->LdrData->InInitializationOrderModuleList;
     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
     {
-        mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, 
+        mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
                                 InInitializationOrderLinks);
         if ( !(mod->Flags & LDR_PROCESS_ATTACHED) )
             continue;
@@ -1940,6 +1960,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, LPCWSTR name, HANDLE file,
     NTSTATUS status;
 
     WINE_TRACE("Trying native dll %s\n", wine_dbgstr_w(name));
+    printf("Trying native dll %s\n", wine_dbgstr_w(name));
 
     status = map_library(file, &module, &len);
     if (status != STATUS_SUCCESS && status != STATUS_IMAGE_NOT_AT_BASE)
@@ -1992,6 +2013,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, LPCWSTR name, HANDLE file,
     }
 
     WINE_TRACE( "Loaded %s at %p: native\n", wine_dbgstr_w(wm->ldr.FullDllName.Buffer), module );
+    printf( "Loaded %s at %p: native\n", wine_dbgstr_w(wm->ldr.FullDllName.Buffer), module );
 
     wm->ldr.LoadCount = 1;
     *pwm = wm;
@@ -2758,14 +2780,14 @@ void WINAPI LdrShutdownThread(void)
     mark = &qemu_getTEB()->Peb->LdrData->InInitializationOrderModuleList;
     for (entry = mark->Blink; entry != mark; entry = entry->Blink)
     {
-        mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, 
+        mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
                                 InInitializationOrderLinks);
         if ( !(mod->Flags & LDR_PROCESS_ATTACHED) )
             continue;
         if ( mod->Flags & LDR_NO_DLL_CALLS )
             continue;
 
-        MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr), 
+        MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr),
                         DLL_THREAD_DETACH, NULL );
     }
 
@@ -2942,6 +2964,8 @@ static NTSTATUS attach_process_dlls( void *wm )
                  wine_dbgstr_w(last_failed_modref->ldr.BaseDllName.Buffer) + 1 );
         return status;
     }
+    printf("process_attach succeeded. Calling attach_implicitly_loaded_dlls.\n");
+
     attach_implicitly_loaded_dlls( (LPVOID)1 );
     imports_fixup_done = TRUE;
     LdrUnlockLoaderLock( 0, magic );
@@ -3105,6 +3129,8 @@ NTSTATUS qemu_LdrInitializeThunk(void)
     LPCWSTR load_path;
     PEB *peb = qemu_getTEB()->Peb;
     PEB *hostpeb = NtCurrentTeb()->Peb;
+
+    printf("Starting qemu_LdrInitializeThunk.\n");
 
     if (main_exe_file) NtClose( main_exe_file );  /* at this point the main module is created */
 
@@ -3322,7 +3348,7 @@ HMODULE qemu_LoadLibrary(const WCHAR *name, DWORD flags)
     HMODULE hModule;
     WCHAR *load_path;
     UNICODE_STRING wstr;
-    static const DWORD unsupported_flags = 
+    static const DWORD unsupported_flags =
         LOAD_IGNORE_CODE_AUTHZ_LEVEL |
         LOAD_LIBRARY_AS_IMAGE_RESOURCE |
         LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |

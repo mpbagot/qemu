@@ -478,6 +478,7 @@ static void cpu_loop(const void *code)
         {
             case EXCP_SYSCALL:
                 syscall = g2h(env->regs[R_ECX]);
+                printf("syscall pointer from ecx is %p.\n", syscall);
                 if (!syscall) /* Return from guest to host. */
                     return;
 
@@ -656,7 +657,9 @@ uint64_t qemu_execute(const void *code, uint64_t rcx)
     }
 
     WINE_TRACE("Going to call guest code %p.\n", code);
+    printf("Going to call guest code %p. RCX is %p\n", code, rcx);
     cpu_loop(code);
+    printf("cpu_loop complete.\n");
 
     if (is_32_bit)
         teb->LastErrorValue = guest_teb32->LastErrorValue;
@@ -1225,6 +1228,25 @@ static void hook(void *to_hook, const void *replace)
     hooked_function->dst = replace;
 
     __clear_cache(hooked_function, (char *)hooked_function + sizeof(*hooked_function));
+#elif __arm__
+    struct hooked_function
+    {
+        DWORD push, ldr, br, pop, bx;
+        const void *dst;
+    } *hooked_function = to_hook;
+
+    if(!VirtualProtect(hooked_function, sizeof(*hooked_function), PAGE_EXECUTE_READWRITE, &old_protect))
+        fprintf(stderr, "Failed to make hooked function writeable.\n");
+
+    offset = offsetof(struct hooked_function, dst) - offsetof(struct hooked_function, ldr);
+    hooked_function->push = 0xe92d4010; /* push {r4, lr} */
+    hooked_function->ldr = 0xe59f4000 | (offset - 4);   /* ldr r4, offset */;
+    hooked_function->br = 0xe12fff34; /* blx r4 */;
+    hooked_function->pop = 0xe8bd4010; /* pop {r4, lr} */
+    hooked_function->bx = 0xe12fff1e; /* bx lr */
+    hooked_function->dst = replace;
+
+    __clear_cache(hooked_function, (char *)hooked_function + sizeof(*hooked_function));
 #elif defined(__x86_64__)
     struct hooked_function
     {
@@ -1276,7 +1298,9 @@ int main(int argc, char **argv, char **envp)
     /* FIXME: The order of operations is a mess, especially setting up the TEB and loading the
      * guest binary. */
 
+#ifndef __arm__ // On 32 bit architectures, 4GB is the entire address space, so this is pointless
     fill_4g_holes();
+#endif
 
     parallel_cpus = true;
 
@@ -1343,6 +1367,13 @@ int main(int argc, char **argv, char **envp)
         ExitProcess(EXIT_FAILURE);
     }
 
+#ifdef __arm__
+    if (!is_32_bit) {
+        fprintf(stderr, "Running 64-bit guest programs on 32-bit host is not yet supported.\n");
+        ExitProcess(EXIT_FAILURE);
+    }
+#endif
+
     LdrLockLoaderLock( 0, NULL, &magic );
     nts = LdrFindEntryForAddress( NtCurrentTeb()->Peb->ImageBaseAddress, &self_module );
     if (nts)
@@ -1368,6 +1399,8 @@ int main(int argc, char **argv, char **envp)
     {
         fprintf(stderr, "Failed to load host DLLs\n");
         ExitProcess(EXIT_FAILURE);
+    } else {
+        fprintf(stdout, "Host DLLs loaded successfully.\n");
     }
 
     if (is_32_bit)
@@ -1385,10 +1418,14 @@ int main(int argc, char **argv, char **envp)
             /* Make sure the stack has some room before we block the address space above 4 GB. */
             growstack();
         }
+#ifndef __arm__
         block_address_space();
+#endif
     }
 
+#ifndef __arm__
     free_4g_holes(large_address_aware);
+#endif
 
     /* Make sure our TEB and Stack don't accidentally block the exe file. */
     reserved = VirtualAlloc((void *)image_base, image_size, MEM_RESERVE, PAGE_NOACCESS);
@@ -1464,6 +1501,7 @@ int main(int argc, char **argv, char **envp)
         ExitProcess(EXIT_FAILURE);
     }
     WINE_TRACE("Process init done.\n");
+    printf("Process init done.\n");
 
     /* Should not return, guest_call_entry calls ExitProcess if need be. */
     ret = qemu_execute(QEMU_G2H(guest_call_entry), QEMU_H2G(image.entrypoint));

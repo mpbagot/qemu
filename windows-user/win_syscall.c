@@ -158,6 +158,7 @@ BOOL load_host_dlls(void)
         }
 
         qemu_log_mask(LOG_WIN32, "Registered DLL %s with number %u.\n", path, dll_num);
+        printf("Registered DLL %s with number %u.\n", path, dll_num);
         dlls[dll_num].handlers = handlers;
         dlls[dll_num].module = mod;
         loaded_dlls++;
@@ -189,6 +190,7 @@ void do_syscall(struct qemu_syscall *call)
     uint32_t func = call->id & 0xffffffff;
 
     WINE_TRACE("Handling syscall %16lx.\n", call->id);
+    printf("Handling syscall %16lx.\n", call->id);
 
     if (WINE_WARN_ON(heap) && !HeapValidate(GetProcessHeap(), 0, NULL))
     {
@@ -196,6 +198,7 @@ void do_syscall(struct qemu_syscall *call)
         ExitProcess(1);
     }
 
+    printf("Calling function %u from dll %u.\n", func, dll);
     dlls[dll].handlers[func](call);
 
     if (WINE_WARN_ON(heap) && !HeapValidate(GetProcessHeap(), 0, NULL))

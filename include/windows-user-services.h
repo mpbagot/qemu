@@ -278,6 +278,7 @@ struct qemu_ops
     NTSTATUS (*qemu_LdrLoadDll)(LPCWSTR path_name, DWORD flags, const UNICODE_STRING *libname, HMODULE* hModule);
     void (*qemu_set_except_handler)(uint64_t handler);
     void (*qemu_set_call_entry)(uint64_t call_entry);
+// #endif
     BOOL (*qemu_FindEntryForAddress)(void *addr, HMODULE *mod);
     NTSTATUS (*qemu_LdrDisableThreadCalloutsForDll)(HMODULE mod);
     void *(*qemu_LdrResolveDelayLoadedAPI)(void* base, const IMAGE_DELAYLOAD_DESCRIPTOR* desc,
@@ -287,8 +288,13 @@ struct qemu_ops
     NTSTATUS (*qemu_LdrGetDllHandle)(LPCWSTR load_path, ULONG flags, const UNICODE_STRING *name, HMODULE *base);
     BOOL (*qemu_DllMain)(DWORD reason, void *reserved);
     NTSTATUS (*qemu_set_context)(HANDLE thread, void *ctx);
+// #ifdef __arm__
+//     HMODULE (*qemu_module_g2h)(uint32_t guest);
+//     uint32_t (*qemu_module_h2g)(HMODULE host);
+// #else
     HMODULE (*qemu_module_g2h)(uint64_t guest);
     uint64_t (*qemu_module_h2g)(HMODULE host);
+// #endif
     const WCHAR *(*qemu_getpath)(void);
 };
 
@@ -299,7 +305,11 @@ typedef const syscall_handler *(WINAPI *syscall_lib_register)(const struct qemu_
  * need a host pointer or vice versa. It has the practical purpose of shutting up the int to ptr conversion
  * warning. If we ever have a diverging address space this will probably call into qemu_ops. */
 #define QEMU_G2H(a)((void *)(a))
+#ifdef __arm__
+#define QEMU_H2G(a)((uint32_t)(a))
+#else
 #define QEMU_H2G(a)((uint64_t)(a))
+#endif
 
 #else
 
